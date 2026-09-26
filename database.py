@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
+from blackout import parse_window, plan_blackout, reject_if_conflicted
+
 
 class DomainError(ValueError):
     """A business-rule violation that should be shown to the API caller."""
@@ -118,6 +120,30 @@ class RadioDB:
               detail TEXT NOT NULL,
               created_at TEXT NOT NULL,
               UNIQUE(air_date, slot_id, kind)
+            );
+            CREATE TABLE IF NOT EXISTS blackouts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              region TEXT NOT NULL,
+              air_date TEXT NOT NULL,
+              start_time TEXT NOT NULL,
+              end_time TEXT NOT NULL,
+              reason TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active','restored')),
+              created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_blackout_window
+              ON blackouts(region,air_date,start_time,end_time) WHERE status='active';
+            CREATE TABLE IF NOT EXISTS blackout_cancellations (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              blackout_id INTEGER NOT NULL REFERENCES blackouts(id) ON DELETE CASCADE,
+              slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+              program_id INTEGER NOT NULL REFERENCES programs(id),
+              start_time TEXT NOT NULL,
+              duration_minutes INTEGER NOT NULL,
+              replaced_from INTEGER REFERENCES programs(id),
+              previous_status TEXT NOT NULL,
+              UNIQUE(blackout_id, slot_id)
             );
             """
         )
@@ -356,11 +382,120 @@ class RadioDB:
             "SELECT * FROM reconciliation_exceptions WHERE air_date=? ORDER BY slot_id, kind", (air_date,)
         ).fetchall()]
 
+    # --- emergency blackout -------------------------------------------------
+
+    def _blackout_cancellations(self, blackout_id: int) -> list[dict]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT bc.*, p.title FROM blackout_cancellations bc "
+            "JOIN programs p ON p.id=bc.program_id "
+            "WHERE bc.blackout_id=? ORDER BY bc.start_time, bc.slot_id", (blackout_id,)
+        ).fetchall()]
+
+    def get_blackout(self, blackout_id: int) -> dict:
+        row = self.conn.execute("SELECT * FROM blackouts WHERE id=?", (blackout_id,)).fetchone()
+        if not row:
+            raise DomainError("停播记录不存在")
+        result = dict(row)
+        result["cancellations"] = self._blackout_cancellations(blackout_id)
+        return result
+
+    def list_blackouts(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM blackouts ORDER BY air_date DESC, start_time DESC, id DESC"
+        ).fetchall()
+        blackouts = []
+        for row in rows:
+            item = dict(row)
+            item["cancellations"] = self._blackout_cancellations(item["id"])
+            blackouts.append(item)
+        return blackouts
+
+    def register_blackout(self, region: str, air_date: str, start_time: str, end_time: str,
+                          reason: str = "") -> dict:
+        """Register an emergency blackout and cancel unaired overlapping slots.
+
+        Slots that already have playout records are never touched; when the
+        window overlaps a real playout interval the whole entry is rejected
+        with the conflicts. Resubmitting the same active window reuses the
+        original result.
+        """
+        region, air_date, start_time, end_time = parse_window(region, air_date, start_time, end_time)
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT id FROM blackouts WHERE region=? AND air_date=? AND start_time=? AND end_time=? AND status='active'",
+                (region, air_date, start_time, end_time),
+            ).fetchone()
+            if existing:
+                result = self.get_blackout(int(existing["id"]))
+                result["reused"] = True
+                return result
+
+            slots = [dict(row) for row in self.conn.execute(
+                "SELECT id, air_date, start_time, duration_minutes, program_id, region, status, replaced_from "
+                "FROM slots WHERE air_date=? AND region=?", (air_date, region)
+            ).fetchall()]
+            playouts = [dict(row) for row in self.conn.execute(
+                "SELECT l.id AS playout_id, l.slot_id, l.actual_start, l.actual_duration_minutes, "
+                "s.region, s.air_date, p.title "
+                "FROM playout_logs l JOIN slots s ON s.id=l.slot_id "
+                "LEFT JOIN programs p ON p.id=COALESCE(l.actual_program_id,s.program_id) "
+                "WHERE s.air_date=? AND s.region=?", (air_date, region)
+            ).fetchall()]
+            plan = plan_blackout(region, air_date, start_time, end_time, slots, playouts)
+            reject_if_conflicted(plan)
+
+            cur = self.conn.execute(
+                "INSERT INTO blackouts(region,air_date,start_time,end_time,reason,created_at) VALUES(?,?,?,?,?,?)",
+                (region, air_date, start_time, end_time, reason.strip(), datetime.now().isoformat()),
+            )
+            blackout_id = int(cur.lastrowid)
+            for slot in plan.affected:
+                self.conn.execute(
+                    "INSERT INTO blackout_cancellations"
+                    "(blackout_id,slot_id,program_id,start_time,duration_minutes,replaced_from,previous_status) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (blackout_id, slot["id"], slot["program_id"], slot["start_time"],
+                     slot["duration_minutes"], slot.get("replaced_from"), slot["status"]),
+                )
+                self.conn.execute("UPDATE slots SET status='cancelled' WHERE id=?", (slot["id"],))
+        result = self.get_blackout(blackout_id)
+        result["reused"] = False
+        return result
+
+    def restore_blackout(self, blackout_id: int) -> dict:
+        """Undo a blackout: restore every slot still cancelled from the snapshot."""
+        with self.transaction():
+            blackout = self.conn.execute("SELECT * FROM blackouts WHERE id=?", (blackout_id,)).fetchone()
+            if not blackout:
+                raise DomainError("停播记录不存在")
+            if blackout["status"] != "active":
+                raise DomainError("该停播记录已恢复，无需重复操作")
+            restored: list[int] = []
+            skipped: list[int] = []
+            for item in self._blackout_cancellations(blackout_id):
+                slot = self.conn.execute("SELECT status FROM slots WHERE id=?", (item["slot_id"],)).fetchone()
+                if not slot or slot["status"] != "cancelled":
+                    skipped.append(item["slot_id"])
+                    continue
+                self.conn.execute(
+                    "UPDATE slots SET program_id=?, start_time=?, duration_minutes=?, replaced_from=?, status=? "
+                    "WHERE id=?",
+                    (item["program_id"], item["start_time"], item["duration_minutes"],
+                     item["replaced_from"], item["previous_status"], item["slot_id"]),
+                )
+                restored.append(item["slot_id"])
+            self.conn.execute("UPDATE blackouts SET status='restored' WHERE id=?", (blackout_id,))
+        result = self.get_blackout(blackout_id)
+        result["restored_slots"] = restored
+        result["skipped_slots"] = skipped
+        return result
+
     def snapshot(self) -> dict:
         programs = [dict(row) for row in self.conn.execute("SELECT * FROM programs ORDER BY id").fetchall()]
         slots = [dict(row) for row in self.conn.execute(
             "SELECT s.*, p.title, p.kind FROM slots s JOIN programs p ON p.id=s.program_id ORDER BY s.air_date,s.start_time"
         ).fetchall()]
-        return {"programs": programs, "slots": slots, "exceptions": [dict(row) for row in self.conn.execute(
+        return {"programs": programs, "slots": slots, "blackouts": self.list_blackouts(),
+                "exceptions": [dict(row) for row in self.conn.execute(
             "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
         ).fetchall()]}

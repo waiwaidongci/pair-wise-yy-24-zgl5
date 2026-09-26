@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from blackout import BlackoutConflictError
 from database import DomainError, RadioDB
 
 BASE = Path(__file__).resolve().parent
@@ -95,7 +96,19 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":
                 self.db.authorize_region(int(parts[2]), str(body.get("region", "")))
                 return self._json(201, {"ok": True})
+            if parsed.path == "/api/blackouts":
+                blackout = self.db.register_blackout(
+                    str(body.get("region", "")), str(body.get("air_date", "")),
+                    str(body.get("start_time", "")), str(body.get("end_time", "")),
+                    str(body.get("reason", "")),
+                )
+                reused = blackout.pop("reused", False)
+                return self._json(200 if reused else 201, {"ok": True, "reused": reused, "blackout": blackout})
+            if len(parts) == 4 and parts[:2] == ["api", "blackouts"] and parts[3] == "restore":
+                return self._json(200, {"ok": True, "blackout": self.db.restore_blackout(int(parts[2]))})
             self._json(404, {"ok": False, "error": "接口不存在"})
+        except BlackoutConflictError as exc:
+            self._json(409, {"ok": False, "error": str(exc), "conflicts": exc.conflicts})
         except (DomainError, ValueError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
 
