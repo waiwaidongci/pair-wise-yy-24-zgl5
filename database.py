@@ -119,6 +119,28 @@ class RadioDB:
               created_at TEXT NOT NULL,
               UNIQUE(air_date, slot_id, kind)
             );
+            CREATE TABLE IF NOT EXISTS suspensions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              region TEXT NOT NULL,
+              air_date TEXT NOT NULL,
+              start_time TEXT NOT NULL,
+              end_time TEXT NOT NULL,
+              reason TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','restored')),
+              created_at TEXT NOT NULL,
+              UNIQUE(region, air_date, start_time, end_time)
+            );
+            CREATE TABLE IF NOT EXISTS suspension_impacts (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              suspension_id INTEGER NOT NULL REFERENCES suspensions(id) ON DELETE CASCADE,
+              slot_id INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
+              original_program_id INTEGER NOT NULL REFERENCES programs(id),
+              original_start_time TEXT NOT NULL,
+              original_duration_minutes INTEGER NOT NULL,
+              original_status TEXT NOT NULL,
+              restored INTEGER NOT NULL DEFAULT 0 CHECK(restored IN (0,1)),
+              UNIQUE(suspension_id, slot_id)
+            );
             """
         )
         self.conn.commit()
@@ -356,6 +378,122 @@ class RadioDB:
             "SELECT * FROM reconciliation_exceptions WHERE air_date=? ORDER BY slot_id, kind", (air_date,)
         ).fetchall()]
 
+    def register_suspension(self, region: str, air_date: str, start_time: str, end_time: str,
+                            reason: str = "") -> dict:
+        """登记应急停播：窗口内未实播的同地区排期转为取消并记录原节目和原时段。
+
+        窗口与实播记录重叠时整笔拒绝并列出冲突；相同地区、日期和起止时间的
+        重复提交直接沿用首次登记的结果。
+        """
+        from suspension import plan_suspension, validate_window
+
+        window = validate_window(region, air_date, start_time, end_time)
+        key = (window["region"], window["air_date"], window["start_time"], window["end_time"])
+        existing = self.conn.execute(
+            "SELECT id FROM suspensions WHERE region=? AND air_date=? AND start_time=? AND end_time=?", key
+        ).fetchone()
+        if existing:
+            result = self.get_suspension(int(existing["id"]))
+            result["reused"] = True
+            return result
+        try:
+            with self.transaction():
+                slots = [dict(row) for row in self.conn.execute(
+                    "SELECT s.*, p.title FROM slots s JOIN programs p ON p.id=s.program_id "
+                    "WHERE s.region=? AND s.air_date=? AND s.status!='cancelled'",
+                    (window["region"], window["air_date"]),
+                ).fetchall()]
+                logs = [dict(row) for row in self.conn.execute(
+                    "SELECT l.* FROM playout_logs l JOIN slots s ON s.id=l.slot_id "
+                    "WHERE s.region=? AND s.air_date=? AND s.status!='cancelled'",
+                    (window["region"], window["air_date"]),
+                ).fetchall()]
+                conflicts, affected = plan_suspension(window, slots, logs)
+                if conflicts:
+                    details = "；".join(
+                        f"排期#{log['slot_id']} 实播 {log['actual_start']} 起 {log['actual_duration_minutes']} 分钟"
+                        for log in conflicts
+                    )
+                    raise DomainError(f"停播窗口与实播记录冲突，已整笔拒绝: {details}")
+                cur = self.conn.execute(
+                    "INSERT INTO suspensions(region,air_date,start_time,end_time,reason,created_at) VALUES(?,?,?,?,?,?)",
+                    (*key, str(reason).strip(), datetime.now().isoformat()),
+                )
+                suspension_id = int(cur.lastrowid)
+                for slot in affected:
+                    self.conn.execute(
+                        "INSERT INTO suspension_impacts(suspension_id,slot_id,original_program_id,"
+                        "original_start_time,original_duration_minutes,original_status) VALUES(?,?,?,?,?,?)",
+                        (suspension_id, slot["id"], slot["program_id"], slot["start_time"],
+                         slot["duration_minutes"], slot["status"]),
+                    )
+                    self.conn.execute("UPDATE slots SET status='cancelled' WHERE id=?", (slot["id"],))
+        except sqlite3.IntegrityError:
+            # 并发重复提交同一窗口，沿用先完成的登记结果
+            existing = self.conn.execute(
+                "SELECT id FROM suspensions WHERE region=? AND air_date=? AND start_time=? AND end_time=?", key
+            ).fetchone()
+            if not existing:
+                raise
+            result = self.get_suspension(int(existing["id"]))
+            result["reused"] = True
+            return result
+        result = self.get_suspension(suspension_id)
+        result["reused"] = False
+        return result
+
+    def get_suspension(self, suspension_id: int) -> dict:
+        row = self.conn.execute("SELECT * FROM suspensions WHERE id=?", (suspension_id,)).fetchone()
+        if not row:
+            raise DomainError("停播记录不存在")
+        impacts = [dict(r) for r in self.conn.execute(
+            "SELECT i.*, p.title AS original_title FROM suspension_impacts i "
+            "JOIN programs p ON p.id=i.original_program_id WHERE i.suspension_id=? ORDER BY i.original_start_time",
+            (suspension_id,),
+        ).fetchall()]
+        result = dict(row)
+        result["impacts"] = impacts
+        return result
+
+    def list_suspensions(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id FROM suspensions ORDER BY air_date DESC, start_time DESC, id DESC"
+        ).fetchall()
+        return [self.get_suspension(int(row["id"])) for row in rows]
+
+    def restore_suspension(self, suspension_id: int) -> dict:
+        """恢复停播：把受影响排期还原到原节目和原时段；原时段被占用则拒绝。"""
+        from suspension import find_restore_conflicts
+
+        with self.transaction():
+            row = self.conn.execute("SELECT * FROM suspensions WHERE id=?", (suspension_id,)).fetchone()
+            if not row:
+                raise DomainError("停播记录不存在")
+            if row["status"] != "active":
+                raise DomainError("该停播已恢复，不能重复操作")
+            impacts = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM suspension_impacts WHERE suspension_id=? AND restored=0", (suspension_id,)
+            ).fetchall()]
+            current = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM slots WHERE air_date=? AND region=? AND status!='cancelled'",
+                (row["air_date"], row["region"]),
+            ).fetchall()]
+            conflicts = find_restore_conflicts(impacts, current)
+            if conflicts:
+                details = "；".join(
+                    f"排期#{c['impact']['slot_id']} 原时段与排期#{c['slot']['id']} 重叠" for c in conflicts
+                )
+                raise DomainError(f"恢复失败，原时段已被占用: {details}")
+            for impact in impacts:
+                self.conn.execute(
+                    "UPDATE slots SET status=?, program_id=?, start_time=?, duration_minutes=? WHERE id=?",
+                    (impact["original_status"], impact["original_program_id"], impact["original_start_time"],
+                     impact["original_duration_minutes"], impact["slot_id"]),
+                )
+                self.conn.execute("UPDATE suspension_impacts SET restored=1 WHERE id=?", (impact["id"],))
+            self.conn.execute("UPDATE suspensions SET status='restored' WHERE id=?", (suspension_id,))
+        return self.get_suspension(suspension_id)
+
     def snapshot(self) -> dict:
         programs = [dict(row) for row in self.conn.execute("SELECT * FROM programs ORDER BY id").fetchall()]
         slots = [dict(row) for row in self.conn.execute(
@@ -363,4 +501,4 @@ class RadioDB:
         ).fetchall()]
         return {"programs": programs, "slots": slots, "exceptions": [dict(row) for row in self.conn.execute(
             "SELECT * FROM reconciliation_exceptions ORDER BY id DESC LIMIT 50"
-        ).fetchall()]}
+        ).fetchall()], "suspensions": self.list_suspensions()}

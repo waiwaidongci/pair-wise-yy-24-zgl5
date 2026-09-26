@@ -57,6 +57,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not date:
                     raise DomainError("缺少 date 参数")
                 return self._json(200, {"exceptions": self.db.get_exceptions(date)})
+            if parsed.path == "/api/suspensions":
+                return self._json(200, {"suspensions": self.db.list_suspensions()})
             self._json(404, {"ok": False, "error": "接口不存在"})
         except DomainError as exc:
             self._json(400, {"ok": False, "error": str(exc)})
@@ -90,6 +92,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": log_id})
             if parsed.path == "/api/reconcile":
                 return self._json(200, {"ok": True, "exceptions": self.db.reconcile_date(str(body.get("date", "")))})
+            if parsed.path == "/api/suspensions":
+                result = self.db.register_suspension(
+                    str(body.get("region", "")), str(body.get("air_date", "")),
+                    str(body.get("start_time", "")), str(body.get("end_time", "")),
+                    str(body.get("reason", "")),
+                )
+                return self._json(200 if result["reused"] else 201, {"ok": True, "suspension": result})
+            if len(parts) == 4 and parts[:2] == ["api", "suspensions"] and parts[3] == "restore":
+                return self._json(200, {"ok": True, "suspension": self.db.restore_suspension(int(parts[2]))})
             if len(parts) == 4 and parts[:2] == ["api", "slots"] and parts[3] == "replace":
                 return self._json(200, {"ok": True, "slot": self.db.replace_slot(int(parts[2]), int(body.get("new_program_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "programs"] and parts[3] == "regions":

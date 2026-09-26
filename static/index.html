@@ -8,6 +8,8 @@ section{background:white;padding:16px;margin:12px 0;border:1px solid #ddd;border
 input,select,button{padding:7px;margin:3px;border:1px solid #bbb;border-radius:6px}
 button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;max-height:360px;overflow:auto}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.grid input{width:90%}
+.sus{border:1px solid #ddd;border-radius:8px;padding:10px;margin:8px 0;background:#fafafa}
+.sus ul{margin:6px 0;padding-left:20px}.sus .tag{font-size:12px;padding:2px 8px;border-radius:10px;background:#eee}
 </style>
 <h1>电台播出与版权窗口排程</h1>
 <section><h2>当前计划</h2><button onclick="load()">刷新</button><pre id="state"></pre></section>
@@ -21,15 +23,35 @@ button{cursor:pointer;background:#16324f;color:white}pre{white-space:pre-wrap;ma
 <input id="sid" type="number" placeholder="排期 ID"><input id="newpid" type="number" placeholder="替换节目 ID"><input id="actualstart" value="12:00">
 <input id="actualduration" type="number" value="30" placeholder="实播分钟"><input id="actualpid" type="number" placeholder="实播节目 ID，可空"></div>
 <button onclick="schedule()">排期</button><button onclick="replace()">替换</button><button onclick="playout()">记录实播</button><button onclick="reconcile()">对账</button><pre id="result"></pre></section>
+<section><h2>应急停播</h2>
+<div class="grid"><input id="susregion" value="华东"><input id="susdate" value="2026-09-28">
+<input id="susstart" value="14:00" placeholder="开始 HH:MM"><input id="susend" value="15:00" placeholder="结束 HH:MM">
+<input id="susreason" placeholder="停播原因，可空"></div>
+<button onclick="suspend()">登记停播</button>
+<div id="suspensions"></div></section>
 <script>
 const api=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();out(j);return j};
 const out=x=>document.querySelector('#result').textContent=JSON.stringify(x,null,2);
-async function load(){document.querySelector('#state').textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function load(){document.querySelector('#state').textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2);loadSuspensions()}
 function addProgram(){api('/api/programs',{title:title.value,kind:kind.value,duration_minutes:+duration.value,start_date:start.value,end_date:end.value,region:region.value,regions:[region.value],sponsor:sponsor.value||null,cooldown_minutes:+cooldown.value})}
 function schedule(){api('/api/schedule',{air_date:airdate.value,start_time:starttime.value,program_id:+pid.value,region:region.value})}
 function replace(){api('/api/slots/'+sid.value+'/replace',{new_program_id:+newpid.value})}
 function playout(){api('/api/playout',{slot_id:+sid.value,actual_start:actualstart.value,actual_duration_minutes:+actualduration.value,actual_program_id:actualpid.value?+actualpid.value:null})}
 function reconcile(){api('/api/reconcile',{date:airdate.value})}
+function suspend(){api('/api/suspensions',{region:susregion.value,air_date:susdate.value,start_time:susstart.value,end_time:susend.value,reason:susreason.value}).then(load)}
+async function restoreSuspension(id){const r=await fetch('/api/suspensions/'+id+'/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});out(await r.json());load()}
+async function loadSuspensions(){
+  const j=await (await fetch('/api/suspensions')).json();
+  const box=document.querySelector('#suspensions');
+  if(!j.suspensions.length){box.innerHTML='<p>暂无停播记录</p>';return}
+  box.innerHTML=j.suspensions.map(s=>{
+    const impacts=s.impacts.map(i=>`<li>排期#${i.slot_id} 原节目《${esc(i.original_title)}》 原时段 ${i.original_start_time} 起 ${i.original_duration_minutes} 分钟${i.restored?'（已恢复）':''}</li>`).join('')||'<li>窗口内无受影响排期</li>';
+    const tag=s.status==='active'?'<span class="tag">生效中</span>':'<span class="tag">已恢复</span>';
+    const btn=s.status==='active'?` <button onclick="restoreSuspension(${s.id})">恢复</button>`:'';
+    return `<div class="sus"><b>#${s.id} ${esc(s.region)} ${s.air_date} ${s.start_time}–${s.end_time}</b> ${tag}${btn}${s.reason?`<div>原因：${esc(s.reason)}</div>`:''}<ul>${impacts}</ul></div>`;
+  }).join('');
+}
 load();
 </script>
 </html>
